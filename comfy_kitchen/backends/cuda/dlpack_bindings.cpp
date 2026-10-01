@@ -180,7 +180,8 @@ extern "C" {
         int BLKQ, int WARPQ, int BLKK, int WARPK,
         int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
         int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
-        int input_dtype_code, void* anchor_indices, cudaStream_t stream);
+        int input_dtype_code, void* anchor_indices, void* lse, float lse_scale,
+        cudaStream_t stream);
 
     void launch_quant_v_int8_kernel(
         const void* v, void* out, void* scale,
@@ -933,7 +934,7 @@ void quant_qk_per_thread_int8(
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         input_dtype_code,
-        reinterpret_cast<void *>(anchor_indices_ptr), stream);
+        reinterpret_cast<void *>(anchor_indices_ptr), nullptr, 0.f, stream);
 }
 
 // Quantization half of the split INT8 SDPA API.  This deliberately launches
@@ -1010,7 +1011,7 @@ void sage_sdpa_quantize(
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         input_dtype_code,
-        reinterpret_cast<void *>(anchor_indices_ptr), stream);
+        reinterpret_cast<void *>(anchor_indices_ptr), nullptr, 0.f, stream);
 
     launch_quant_v_int8_kernel(
         v.data(), v_int8.data(), v_scale.data(),
@@ -1333,7 +1334,7 @@ void sage_sdpa(
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         input_dtype_code,
-        reinterpret_cast<void *>(anchor_indices_ptr), stream);
+        reinterpret_cast<void *>(anchor_indices_ptr), lse_ptr, sm_scale, stream);
 
     launch_quant_v_int8_kernel(
         v.data(), v_int8.data(), v_scale.data(),

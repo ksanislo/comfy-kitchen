@@ -143,7 +143,6 @@ def _int8_attention_cuda(
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     attn_mask = _validate_inputs(q, k, v, attn_mask)
-    unpadded_q, unpadded_k = q, k
 
     original_head_dim = q.shape[-1]
     if original_head_dim <= 64:
@@ -271,19 +270,6 @@ def _int8_attention_cuda(
     output = output.float() if q.dtype == torch.float32 else output
     if lse is None:
         return output
-    # The quantizer may subtract one key from every key of a head. That shifts
-    # each query's scores by q . k[anchor], which leaves the softmax unchanged
-    # but not its log-sum-exp, so add the shift back.
-    has_anchor = anchor_indices >= 0
-    anchor_rows = anchor_indices.clamp(min=0).long()
-    anchor_keys = torch.gather(
-        unpadded_k, 2, anchor_rows[:, :, None, None].expand(-1, -1, 1, unpadded_k.shape[-1])
-    ).squeeze(2)
-    anchor_keys = anchor_keys.repeat_interleave(q_heads // kv_heads, dim=1)
-    shift = torch.einsum("bhsd,bhd->bhs", unpadded_q.float(), anchor_keys.float())
-    shift = shift * attention_scale
-    has_anchor = has_anchor.repeat_interleave(q_heads // kv_heads, dim=1)[:, :, None]
-    lse = torch.where(has_anchor, lse + shift, lse)
     return output, lse
 
 
