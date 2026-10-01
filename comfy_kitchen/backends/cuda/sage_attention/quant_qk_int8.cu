@@ -155,16 +155,30 @@ __forceinline__ __device__ void convrot128(float *values) {
   convrot128_plain(values);
 }
 
+__forceinline__ __device__ float warp_reduce_fsum(float v) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    v += __shfl_xor_sync(0xffffffffu, v, offset);
+  return v;
+}
+
 // ---------------------------------------------------------------------------
 // Q processing device function
 // ---------------------------------------------------------------------------
+// When lse_rows is set, each row's q . k_anchor * lse_scale is written there
+// before rotation: key centring subtracts k_anchor from every key, which
+// leaves the softmax unchanged but lowers each row's log-sum-exp by exactly
+// that amount, and the attention kernel adds its own log-sum-exp on top.
+// k_anchor is null when the head was not centred.
 #pragma nv_diag_suppress 1056
 template <typename T, int NR, int BLKQ, int WARPQ, int CHANNEL_TILES,
           int ROTATION, bool ALIGNED4>
 __forceinline__ __device__ void
 process_q(const T *__restrict__ in, int8_t *__restrict__ out,
           float *__restrict__ sc_buf, const int oblk, const int L,
-          const int C, const int64_t stride_n) {
+          const int C, const int64_t stride_n,
+          const T *__restrict__ k_anchor = nullptr,
+          float *__restrict__ lse_rows = nullptr, const float lse_scale = 0.f) {
   constexpr int NSUB = BLKQ / WARPQ;
   const int lane = threadIdx.x & 31;
   const int wid = threadIdx.x >> 5;
@@ -213,6 +227,42 @@ process_q(const T *__restrict__ in, int8_t *__restrict__ out,
             }
           }
         }
+      }
+    }
+
+    if (lse_rows != nullptr) {
+      float dots[NR];
+#pragma unroll
+      for (int j = 0; j < NR; ++j)
+        dots[j] = 0.f;
+      if (k_anchor != nullptr) {
+#pragma unroll
+        for (int tile = 0; tile < CHANNEL_TILES; ++tile) {
+          const int ch = tile * 128 + (lane << 2);
+          const int tile_base = tile * NR * 4;
+          float kv[4] = {0.f, 0.f, 0.f, 0.f};
+          if (ALIGNED4 || ch + 3 < C) {
+            VectorLoader4<T>::load(&k_anchor[ch], kv);
+          } else if (ch < C) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c)
+              kv[c] = (ch + c < C) ? static_cast<float>(__ldg(&k_anchor[ch + c]))
+                                   : 0.f;
+          }
+#pragma unroll
+          for (int j = 0; j < NR; ++j) {
+            const int vi = tile_base + j * 4;
+            dots[j] += v[vi] * kv[0] + v[vi + 1] * kv[1] + v[vi + 2] * kv[2] +
+                       v[vi + 3] * kv[3];
+          }
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < NR; ++j) {
+        const float dot = warp_reduce_fsum(dots[j]);
+        const int n = base + j * 8;
+        if (lane == 0 && n < L)
+          lse_rows[n] = dot * lse_scale;
       }
     }
 
@@ -613,14 +663,28 @@ __global__ __launch_bounds__(128, 4) void quant_q_kernel(
     const T *__restrict__ q_in, int8_t *__restrict__ q_out,
     float *__restrict__ q_sb, const int Lq, const int C, const int H_q,
     const int q_sc_per_h, const int64_t stride_b, const int64_t stride_h,
-    const int64_t stride_n) {
+    const int64_t stride_n, const T *__restrict__ k_in,
+    const int *__restrict__ anchor_indices, const int H_kv,
+    const int64_t k_stride_b, const int64_t k_stride_h,
+    const int64_t k_stride_n, float *__restrict__ lse, const float lse_scale) {
   const int oblk = blockIdx.x;
   const int h = blockIdx.y, b = blockIdx.z;
   const int64_t in_bh = (int64_t)b * stride_b + (int64_t)h * stride_h;
   const int64_t out_bh = ((int64_t)b * H_q + h) * Lq * C;
   const int64_t sbh = ((int64_t)b * H_q + h) * q_sc_per_h;
+  const T *k_anchor = nullptr;
+  float *lse_rows = nullptr;
+  if (lse != nullptr) {
+    const int h_kv = h / (H_q / H_kv);
+    const int anchor_index = __ldg(&anchor_indices[b * H_kv + h_kv]);
+    if (anchor_index >= 0)
+      k_anchor = k_in + (int64_t)b * k_stride_b + (int64_t)h_kv * k_stride_h +
+                 (int64_t)anchor_index * k_stride_n;
+    lse_rows = lse + ((int64_t)b * H_q + h) * Lq;
+  }
   process_q<T, NR, BLKQ, WARPQ, CHANNEL_TILES, ROTATION, ALIGNED4>(
-      q_in + in_bh, q_out + out_bh, q_sb + sbh, oblk, Lq, C, stride_n);
+      q_in + in_bh, q_out + out_bh, q_sb + sbh, oblk, Lq, C, stride_n,
+      k_anchor, lse_rows, lse_scale);
 }
 
 // ---------------------------------------------------------------------------
@@ -661,7 +725,8 @@ __global__ __launch_bounds__(128, 3) void quant_qk_fused(
     const int H_q, const int H_kv, const int q_sc_per_h, const int k_sc_per_h,
     const int64_t q_stride_b, const int64_t q_stride_h,
     const int64_t q_stride_n, const int64_t k_stride_b,
-    const int64_t k_stride_h, const int64_t k_stride_n) {
+    const int64_t k_stride_h, const int64_t k_stride_n,
+    float *__restrict__ lse, const float lse_scale) {
   const int h = blockIdx.y, b = blockIdx.z;
 
   if (blockIdx.x < (unsigned)q_oblk_count) {
@@ -670,9 +735,19 @@ __global__ __launch_bounds__(128, 3) void quant_qk_fused(
     const int64_t in_bh = (int64_t)b * q_stride_b + (int64_t)h * q_stride_h;
     const int64_t out_bh = ((int64_t)b * H_q + h) * Lq * C;
     const int64_t sbh = ((int64_t)b * H_q + h) * q_sc_per_h;
+    const T *k_anchor = nullptr;
+    float *lse_rows = nullptr;
+    if (lse != nullptr) {
+      const int h_kv = h / (H_q / H_kv);
+      const int anchor_index = __ldg(&anchor_indices[b * H_kv + h_kv]);
+      if (anchor_index >= 0)
+        k_anchor = k_in + (int64_t)b * k_stride_b + (int64_t)h_kv * k_stride_h +
+                   (int64_t)anchor_index * k_stride_n;
+      lse_rows = lse + ((int64_t)b * H_q + h) * Lq;
+    }
     process_q<T, NR, BLKQ, WARPQ, CHANNEL_TILES, ROTATION, ALIGNED4>(
         q_in + in_bh, q_out + out_bh, q_sb + sbh, blockIdx.x, Lq, C,
-        q_stride_n);
+        q_stride_n, k_anchor, lse_rows, lse_scale);
   } else {
     if (h >= H_kv)
       return;
@@ -694,7 +769,7 @@ extern "C" void launch_quant_qk_per_thread_int8(
     int WARPQ, int BLKK, int WARPK, int64_t q_stride_b, int64_t q_stride_h,
     int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h,
     int64_t k_stride_n, int input_dtype_code, void *anchor_indices,
-    cudaStream_t stream) {
+    void *lse, float lse_scale, cudaStream_t stream) {
   if (C != 64 && C != 128 && C != 256) {
     throw std::runtime_error(
         "quant_qk_per_thread_int8: padded head_dim must be 64, 128, or 256");
@@ -738,6 +813,7 @@ extern "C" void launch_quant_qk_per_thread_int8(
   const int q_sc_per_h = q_oblk * 8;
   const int k_sc_per_h = k_oblk * 4;
   auto *anchor_ptr = static_cast<int *>(anchor_indices);
+  auto *lse_ptr = static_cast<float *>(lse);
   dim3 gd(H_kv, B);
   DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
     detect_k_anchor<T><<<gd, CENTER_DETECT_THREADS, 0, stream>>>(
@@ -756,7 +832,9 @@ extern "C" void launch_quant_qk_per_thread_int8(
     quant_q_kernel<T, NR, BQ, WQ, CT, ROT, A4>                                 \
         <<<gq, 128, 0, stream>>>((const T *)q, (int8_t *)q_int8,               \
                                  (float *)q_scale, Lq, C, H_q, q_sc_per_h,     \
-                                 q_stride_b, q_stride_h, q_stride_n);           \
+                                 q_stride_b, q_stride_h, q_stride_n,           \
+                                 (const T *)k, anchor_ptr, H_kv, k_stride_b,   \
+                                 k_stride_h, k_stride_n, lse_ptr, lse_scale);  \
     cudaError_t q_error = cudaGetLastError();                                   \
     if (q_error != cudaSuccess)                                                 \
       throw std::runtime_error(std::string("quant_q kernel launch failed: ") + \
@@ -781,7 +859,7 @@ extern "C" void launch_quant_qk_per_thread_int8(
         (const T *)q, (int8_t *)q_int8, (float *)q_scale, (const T *)k,        \
         (int8_t *)k_int8, (float *)k_scale, anchor_ptr, Lq, Lk, C,             \
         q_oblk, H_q, H_kv, q_sc_per_h, k_sc_per_h, q_stride_b, q_stride_h,     \
-        q_stride_n, k_stride_b, k_stride_h, k_stride_n);                       \
+        q_stride_n, k_stride_b, k_stride_h, k_stride_n, lse_ptr, lse_scale);   \
     cudaError_t qk_error = cudaGetLastError();                                  \
     if (qk_error != cudaSuccess)                                                \
       throw std::runtime_error(                                                 \

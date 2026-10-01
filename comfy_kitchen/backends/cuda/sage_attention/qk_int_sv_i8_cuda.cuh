@@ -1177,7 +1177,8 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
     // tile, and m and d are already reduced across the lane quad, so the first
     // lane of each quad writes them. m carries the probability offset and d is
     // summed in the same shifted units, so the offset cancels. The result is
-    // converted from the base-2 domain of the kernel to a natural log.
+    // converted from the base-2 domain of the kernel to a natural log and added
+    // to the key-centring shift the quantizer stored for the row.
     if (lane_id % 4 == 0) {
       const uint32_t warp_row_base =
           bx * CTA_Q + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>() +
@@ -1190,7 +1191,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
         for (uint32_t k = 0; k < 2; k++) {
           const uint32_t lse_idx = warp_row_base + fq * MMA_QK_M + 8 * k;
           if (lse_idx < qo_len) {
-            lse_head_ptr[lse_idx] =
+            lse_head_ptr[lse_idx] +=
                 (math::ptx_log2(d[fq][k]) + m[fq][k]) * math::log2e_recp;
           }
         }
