@@ -1179,7 +1179,8 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
     // tile, and m and d are already reduced across the lane quad, so the first
     // lane of each quad writes them. m carries the probability offset and d is
     // summed in the same shifted units, so the offset cancels. Decode pages are
-    // merged in the kernel's base-2 domain; sage_sdpa callers get a natural log.
+    // merged in the kernel's base-2 domain. sage_sdpa callers get a natural log,
+    // added to the key-centring shift the quantizer stored for the row.
     if (lane_id % 4 == 0) {
 #pragma unroll
       for (uint32_t fq = 0; fq < num_tiles_q; ++fq) {
@@ -1188,8 +1189,11 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
           const uint32_t row = bx * CTA_Q + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>() + fq * 16 + lane_id / 4 + k * 8;
           if (row < qo_len) {
             const float lse2 = math::ptx_log2(d[fq][k]) + m[fq][k];
-            Lse[(batch_id * num_qo_heads + head_id) * qo_len + row] =
-                decode_page ? lse2 : lse2 * math::log2e_recp;
+            float &lse = Lse[(batch_id * num_qo_heads + head_id) * qo_len + row];
+            if constexpr (decode_page)
+              lse = lse2;
+            else
+              lse += lse2 * math::log2e_recp;
           }
         }
       }
