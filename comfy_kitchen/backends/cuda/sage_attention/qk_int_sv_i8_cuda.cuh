@@ -1175,14 +1175,22 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
   }
 
   if constexpr (return_lse) {
+    // Each lane holds rows lane_id / 4 and lane_id / 4 + 8 of every 16-row
+    // tile, and m and d are already reduced across the lane quad, so the first
+    // lane of each quad writes them. m carries the probability offset and d is
+    // summed in the same shifted units, so the offset cancels. Decode pages are
+    // merged in the kernel's base-2 domain; sage_sdpa callers get a natural log.
     if (lane_id % 4 == 0) {
 #pragma unroll
       for (uint32_t fq = 0; fq < num_tiles_q; ++fq) {
 #pragma unroll
         for (uint32_t k = 0; k < 2; ++k) {
           const uint32_t row = bx * CTA_Q + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>() + fq * 16 + lane_id / 4 + k * 8;
-          if (row < qo_len)
-            Lse[(batch_id * num_qo_heads + head_id) * qo_len + row] = math::ptx_log2(d[fq][k]) + m[fq][k];
+          if (row < qo_len) {
+            const float lse2 = math::ptx_log2(d[fq][k]) + m[fq][k];
+            Lse[(batch_id * num_qo_heads + head_id) * qo_len + row] =
+                decode_page ? lse2 : lse2 * math::log2e_recp;
+          }
         }
       }
     }
