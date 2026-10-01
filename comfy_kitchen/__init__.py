@@ -26,6 +26,7 @@ from .sage_attention import (
     PrequantizedInt8Attention,
     int8_attention,
     int8_attention_from_prequantized,
+    int8_attention_with_lse,
     prequantize_int8_attention,
 )
 from .sage_attention import is_available as int8_attention_is_available
@@ -65,6 +66,7 @@ __all__ = [
     "int8_attention",
     "int8_attention_from_prequantized",
     "int8_attention_is_available",
+    "int8_attention_with_lse",
     "prequantize_int8_attention",
     "flash_attention_decode",
     "gated_delta_decode_fused",
