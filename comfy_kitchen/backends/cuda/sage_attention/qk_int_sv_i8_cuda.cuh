@@ -819,16 +819,28 @@ __global__ void qk_int_sv_i8_attn_kernel(
   }
 
   if constexpr (return_lse) {
-    // ! this only works for num_tiles_q = 2
-    uint32_t lse_idx = bx * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) +
-                       WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>();
-    float *lse_lane_ptr =
-        Lse + batch_id * (qo_len * num_qo_heads) + head_id * qo_len + lse_idx;
-    uint32_t fq = (lane_id % 4) / 2;
-    uint32_t k = (lane_id % 4) % 2;
-
-    if (lse_idx < qo_len) {
-      lse_lane_ptr[0] = math::ptx_log2(d[fq][k]) + m[fq][k];
+    // Each lane holds rows lane_id / 4 and lane_id / 4 + 8 of every 16-row
+    // tile, and m and d are already reduced across the lane quad, so the first
+    // lane of each quad writes them. m carries the probability offset and d is
+    // summed in the same shifted units, so the offset cancels. The result is
+    // converted from the base-2 domain of the kernel to a natural log.
+    if (lane_id % 4 == 0) {
+      const uint32_t warp_row_base =
+          bx * CTA_Q + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>() +
+          lane_id / 4;
+      float *lse_head_ptr =
+          Lse + batch_id * (qo_len * num_qo_heads) + head_id * qo_len;
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+        for (uint32_t k = 0; k < 2; k++) {
+          const uint32_t lse_idx = warp_row_base + fq * MMA_QK_M + 8 * k;
+          if (lse_idx < qo_len) {
+            lse_head_ptr[lse_idx] =
+                (math::ptx_log2(d[fq][k]) + m[fq][k]) * math::log2e_recp;
+          }
+        }
+      }
     }
   }
 }

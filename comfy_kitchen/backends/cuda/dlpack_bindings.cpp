@@ -189,7 +189,7 @@ extern "C" {
         int input_dtype_code, cudaStream_t stream);
 
     void launch_sage_attn_kernel(
-        const void* q, const void* k, const void* v, void* o,
+        const void* q, const void* k, const void* v, void* o, void* lse,
         const void* q_scale, const void* k_scale, const void* v_scale,
         const void* mask, int64_t mask_stride_b, int64_t mask_stride_h,
         int64_t mask_stride_q, int64_t mask_stride_k, int mask_dtype_code,
@@ -1140,7 +1140,7 @@ void sage_sdpa_prequantized(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_sage_attn_kernel(
-        q_int8.data(), k_int8.data(), v_int8.data(), o.data(),
+        q_int8.data(), k_int8.data(), v_int8.data(), o.data(), nullptr,
         q_scale.data(), k_scale.data(), v_scale.data(),
         mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
         mask_dtype_code, cta_k,
@@ -1200,7 +1200,7 @@ void sage_attn(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_sage_attn_kernel(
-        q.data(), k.data(), v.data(), o.data(),
+        q.data(), k.data(), v.data(), o.data(), nullptr,
         q_scale.data(), k_scale.data(), v_scale.data(),
         nullptr, 0, 0, 0, 0, -1,
         CTA_K,
@@ -1236,7 +1236,8 @@ void sage_sdpa(
     uintptr_t stream_ptr,
     uintptr_t anchor_indices_ptr,
     std::optional<nb::ndarray<nb::device::cuda>> attn_mask = std::nullopt,
-    int cta_k = 0)
+    int cta_k = 0,
+    std::optional<nb::ndarray<nb::device::cuda>> lse = std::nullopt)
 {
     if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
         throw std::runtime_error("sage_sdpa: q, k, v, o must be 4D [B,H,L,D]");
@@ -1248,6 +1249,21 @@ void sage_sdpa(
     const int D = static_cast<int>(q.shape(3));
     const int H_kv = static_cast<int>(k.shape(1));
     const int Lk = static_cast<int>(k.shape(2));
+
+    void *lse_ptr = nullptr;
+    if (lse.has_value()) {
+        const auto &l = lse.value();
+        if (l.ndim() != 3 || l.shape(0) != static_cast<size_t>(B) ||
+            l.shape(1) != static_cast<size_t>(H_q) ||
+            l.shape(2) != static_cast<size_t>(Lq) ||
+            l.dtype().code != (uint8_t)nb::dlpack::dtype_code::Float ||
+            l.dtype().bits != 32 || l.stride(2) != 1 ||
+            l.stride(1) != Lq || l.stride(0) != static_cast<int64_t>(H_q) * Lq) {
+            throw std::runtime_error(
+                "sage_sdpa: lse must be a contiguous float32 [B,H_q,Lq] tensor");
+        }
+        lse_ptr = l.data();
+    }
 
     const void *mask_ptr = nullptr;
     int64_t mask_stride_b = 0;
@@ -1345,7 +1361,7 @@ void sage_sdpa(
     const int v_st_bz = static_cast<int>(v_st_bz64);
 
     launch_sage_attn_kernel(
-        q_int8.data(), k_int8.data(), v_int8.data(), o.data(),
+        q_int8.data(), k_int8.data(), v_int8.data(), o.data(), lse_ptr,
         q_scale.data(), k_scale.data(), v_scale.data(),
         mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
         mask_dtype_code, cta_k,
@@ -4323,7 +4339,8 @@ NB_MODULE(_C, m) {
           nb::arg("stream_ptr"),
           nb::arg("anchor_indices_ptr"),
           nb::arg("attn_mask") = nb::none(),
-          nb::arg("cta_k") = 0);
+          nb::arg("cta_k") = 0,
+          nb::arg("lse") = nb::none());
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,
           "SVDQuant W4A4: smooth + int4 quantize (LoRA-down is external). "

@@ -5,7 +5,9 @@
 // d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5. DLPack-compatible launcher for the
 // Pure integer attention kernel: signed INT8 Q/K/V, unsigned INT8 softmax
 // probabilities, INT32 tensor-core P*V accumulation, and FP32 online-softmax
-// state. V scaling is fused and LSE is not returned.
+// state. V scaling is fused. The log-sum-exp of each query row is written to
+// lse when the caller passes one, for merging partial results across key
+// shards.
 
 #include "qk_int_sv_i8_cuda.cuh"
 #include <algorithm>
@@ -15,8 +17,9 @@
 namespace {
 
 template <int HEAD_DIM, int CTA_K, MaskMode mask_mode, typename DTypeOut,
-          bool fuse_fp32_probabilities = true>
-void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
+          bool fuse_fp32_probabilities = true, bool return_lse = false>
+void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *lse,
+                 float *q_scale,
                  float *k_scale, float *v_scale, const void *mask,
                  int64_t mask_stride_b, int64_t mask_stride_h,
                  int64_t mask_stride_q, int64_t mask_stride_k,
@@ -43,8 +46,8 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
   auto kernel = qk_int_sv_i8_attn_kernel<
       CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8,
       QuantGranularity::kPerThread, QuantGranularity::kPerThread, float, false,
-      DTypeOut, ComputeUnit::kCudaCore, mask_mode, false, true, false, false,
-      fuse_fp32_probabilities>;
+      DTypeOut, ComputeUnit::kCudaCore, mask_mode, return_lse, true, false,
+      false, fuse_fp32_probabilities>;
 
   cudaError_t error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -59,7 +62,7 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
   dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
   kernel<<<grid, block, smem_max, stream>>>(
-      q, k, v, o, nullptr, q_scale, k_scale, v_scale, nullptr, mask,
+      q, k, v, o, lse, q_scale, k_scale, v_scale, nullptr, mask,
       mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
       mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q,
       stride_seq_q, stride_h_q, stride_bz_k, stride_seq_k, stride_h_k,
@@ -76,7 +79,8 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
 } // anonymous namespace
 
 extern "C" void launch_sage_attn_kernel(
-    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *q, const void *k, const void *v, void *o, void *lse,
+    const void *q_scale,
     const void *k_scale, const void *v_scale, const void *mask,
     int64_t mask_stride_b, int64_t mask_stride_h, int64_t mask_stride_q,
     int64_t mask_stride_k, int mask_dtype_code, int cta_k, int batch_size,
@@ -103,17 +107,25 @@ extern "C" void launch_sage_attn_kernel(
   auto qs_ = const_cast<float *>(static_cast<const float *>(q_scale));
   auto ks_ = const_cast<float *>(static_cast<const float *>(k_scale));
   auto vs_ = const_cast<float *>(static_cast<const float *>(v_scale));
+  auto lse_ = static_cast<float *>(lse);
 
-#define LAUNCH(HD, CK, MM, DT, FUSE_FP32)                                     \
-  launch_impl<HD, CK, MM, DT, FUSE_FP32>(                                    \
-                          q_, k_, v_, static_cast<DT *>(o), qs_, ks_, vs_,     \
-                          mask, mask_stride_b, mask_stride_h, mask_stride_q,   \
-                          mask_stride_k, mask_dtype_code, qo_len, kv_len,      \
-                          num_qo_heads, num_kv_groups,                         \
+#define LAUNCH_LSE(HD, CK, MM, DT, FUSE_FP32, LSE, LSE_PTR)                   \
+  launch_impl<HD, CK, MM, DT, FUSE_FP32, LSE>(                               \
+                          q_, k_, v_, static_cast<DT *>(o), LSE_PTR, qs_, ks_, \
+                          vs_, mask, mask_stride_b, mask_stride_h,             \
+                          mask_stride_q, mask_stride_k, mask_dtype_code,       \
+                          qo_len, kv_len, num_qo_heads, num_kv_groups,         \
                           stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,  \
                           stride_seq_k, stride_h_k, stride_bz_v, stride_h_v,   \
                           stride_d_v, stride_bz_o, stride_seq_o, stride_h_o,   \
                           sm_scale, batch_size, stream)
+
+#define LAUNCH(HD, CK, MM, DT, FUSE_FP32)                                     \
+  if (lse_ != nullptr) {                                                      \
+    LAUNCH_LSE(HD, CK, MM, DT, FUSE_FP32, true, lse_);                        \
+  } else {                                                                    \
+    LAUNCH_LSE(HD, CK, MM, DT, FUSE_FP32, false, nullptr);                    \
+  }
 
 #define LAUNCH_CTA(HD, MM, DT, FUSE_FP32)                                     \
   if constexpr (HD == 64) {                                                   \
@@ -170,6 +182,7 @@ extern "C" void launch_sage_attn_kernel(
   }
 
 #undef LAUNCH
+#undef LAUNCH_LSE
 #undef LAUNCH_CTA
 #undef DISPATCH_DTYPE
 #undef DISPATCH_MASK

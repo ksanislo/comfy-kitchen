@@ -140,8 +140,10 @@ def _int8_attention_cuda(
     *,
     scale: float | None = None,
     attn_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     attn_mask = _validate_inputs(q, k, v, attn_mask)
+    unpadded_q, unpadded_k = q, k
 
     original_head_dim = q.shape[-1]
     if original_head_dim <= 64:
@@ -161,6 +163,8 @@ def _int8_attention_cuda(
         raise ValueError(f"scale must be finite, got {attention_scale}")
 
     if _hip_backend is not None:
+        if return_lse:
+            raise NotImplementedError("return_lse is only implemented for the CUDA backend")
         output = _hip_backend.sage_int8_sdpa(
             q,
             k,
@@ -213,6 +217,12 @@ def _int8_attention_cuda(
         batch, kv_heads, dtype=torch.int32, device=q.device
     )
     anchor_indices_ptr = anchor_indices.data_ptr()
+    lse = (
+        torch.empty(batch, q_heads, q_length, dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+    lse_arg = _cuda_backend._wrap_for_dlpack(lse) if lse is not None else None
 
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
     if attn_mask is None:
@@ -233,6 +243,7 @@ def _int8_attention_cuda(
             stream_ptr,
             anchor_indices_ptr,
             cta_k=cta_k,
+            lse=lse_arg,
         )
     else:
         _cuda_backend._C.sage_sdpa(
@@ -253,10 +264,27 @@ def _int8_attention_cuda(
             anchor_indices_ptr,
             _cuda_backend._wrap_for_dlpack(attn_mask),
             cta_k=cta_k,
+            lse=lse_arg,
         )
 
     output = output[..., :original_head_dim]
-    return output.float() if q.dtype == torch.float32 else output
+    output = output.float() if q.dtype == torch.float32 else output
+    if lse is None:
+        return output
+    # The quantizer may subtract one key from every key of a head. That shifts
+    # each query's scores by q . k[anchor], which leaves the softmax unchanged
+    # but not its log-sum-exp, so add the shift back.
+    has_anchor = anchor_indices >= 0
+    anchor_rows = anchor_indices.clamp(min=0).long()
+    anchor_keys = torch.gather(
+        unpadded_k, 2, anchor_rows[:, :, None, None].expand(-1, -1, 1, unpadded_k.shape[-1])
+    ).squeeze(2)
+    anchor_keys = anchor_keys.repeat_interleave(q_heads // kv_heads, dim=1)
+    shift = torch.einsum("bhsd,bhd->bhs", unpadded_q.float(), anchor_keys.float())
+    shift = shift * attention_scale
+    has_anchor = has_anchor.repeat_interleave(q_heads // kv_heads, dim=1)[:, :, None]
+    lse = torch.where(has_anchor, lse + shift, lse)
+    return output, lse
 
 
 def prequantize_int8_attention(
@@ -575,3 +603,22 @@ def int8_attention(
         attn_mask,
         scale,
     )
+
+
+def int8_attention_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """INT8 attention that also returns the natural-log log-sum-exp per query row.
+
+    Takes the same ``[batch, heads, sequence, head_dim]`` inputs as
+    :func:`int8_attention` without a mask, and returns ``(output, lse)`` with
+    ``lse`` shaped ``[batch, heads, q_sequence]`` in float32. The log-sum-exp
+    is what combining attention over separate key shards needs, as ring
+    attention does. CUDA only.
+    """
+    return _int8_attention_cuda(q, k, v, scale=scale, return_lse=True)
+
